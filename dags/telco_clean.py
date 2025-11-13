@@ -1,18 +1,14 @@
 import boto3
 import logging
+import csv
 from io import StringIO
 from datetime import datetime
-import pandas as pd
-
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
 
 # ----------------------------------------------------------------------
-# Bucket configuration
-# The raw file was copied here by my ingestion DAG.
-# This cleaning DAG reads the raw CSV and writes a sanitized version
-# into the processed zone of the same bucket.
+# S3 Bucket configuration
 # ----------------------------------------------------------------------
 DATA_BUCKET = "airflow-telco-data-v-colton"
 RAW_KEY = "raw/Telco-Customer-Churn.csv"
@@ -21,76 +17,102 @@ CLEAN_KEY = "processed/telco_clean.csv"
 
 def clean_telco_data(**context):
     """
-    Load the raw Telco Customer Churn CSV from S3, apply the minimal
-    cleaning steps needed to make the dataset usable, and write the
-    cleaned output back to S3.
+    Clean the Telco Customer Churn dataset using only Python's built-in
+    CSV and string parsing tools so the DAG runs natively on MWAA
+    without requiring external dependencies like pandas.
 
-    Important: this step is **not** feature engineering — just
-    correcting issues in the raw IBM dataset such as empty strings,
-    mis-typed numeric fields, and inconsistent whitespace.
+    Cleaning steps:
+    - Trim whitespace in column names and string values
+    - Convert numeric fields manually
+    - Treat empty strings in TotalCharges as missing
+    - Drop rows missing customerID or TotalCharges
     """
 
     s3 = boto3.client("s3")
 
     # ------------------------------------------------------------------
-    # 1. Load raw CSV from the raw data zone in S3
+    # 1. Load raw CSV into memory
     # ------------------------------------------------------------------
     logging.info(f"Loading raw CSV from s3://{DATA_BUCKET}/{RAW_KEY}")
     obj = s3.get_object(Bucket=DATA_BUCKET, Key=RAW_KEY)
-    df = pd.read_csv(obj["Body"])
-    logging.info(f"Raw dataset loaded. Shape: {df.shape}")
+    raw_csv = obj["Body"].read().decode("utf-8")
+
+    reader = csv.DictReader(StringIO(raw_csv))
+
+    # Normalize column names (strip whitespace)
+    fieldnames = [col.strip() for col in reader.fieldnames]
+
+    cleaned_rows = []
+
+    for row in reader:
+        # Create new dict with stripped column names
+        clean_row = {}
+
+        for col, val in row.items():
+            col_clean = col.strip()
+
+            # Strip whitespace from values as well
+            val_clean = val.strip() if isinstance(val, str) else val
+
+            clean_row[col_clean] = val_clean
+
+        # Drop rows missing customerID
+        if clean_row.get("customerID") in (None, "", " "):
+            continue
+
+        # Convert numeric fields
+        def to_float(x):
+            if x in (None, "", " "):
+                return None
+            try:
+                return float(x)
+            except:
+                return None
+
+        clean_row["MonthlyCharges"] = to_float(clean_row.get("MonthlyCharges"))
+        clean_row["TotalCharges"] = to_float(clean_row.get("TotalCharges"))
+
+        # tenure + SeniorCitizen as ints
+        def to_int(x):
+            if x in (None, "", " "):
+                return None
+            try:
+                return int(float(x))
+            except:
+                return None
+
+        clean_row["tenure"] = to_int(clean_row.get("tenure"))
+        clean_row["SeniorCitizen"] = to_int(clean_row.get("SeniorCitizen"))
+
+        # Drop rows missing TotalCharges (dataset contains ~11)
+        if clean_row["TotalCharges"] is None:
+            continue
+
+        cleaned_rows.append(clean_row)
+
+    logging.info(f"Cleaned dataset size: {len(cleaned_rows)} rows")
 
     # ------------------------------------------------------------------
-    # 2. Clean column names (IBM dataset ships with stray whitespace)
+    # 2. Write cleaned rows back to S3
     # ------------------------------------------------------------------
-    df.columns = df.columns.str.strip()
-
-    # ------------------------------------------------------------------
-    # 3. Strip whitespace inside string columns
-    # This cleans up values like " Yes" or "No ".
-    # ------------------------------------------------------------------
-    df = df.apply(lambda col: col.str.strip() if col.dtype == "object" else col)
-
-    # ------------------------------------------------------------------
-    # 4. Convert numeric fields
-    # The Telco dataset stores numbers as strings, and TotalCharges has
-    # empty strings that must be treated as missing before conversion.
-    # ------------------------------------------------------------------
-    df["TotalCharges"] = df["TotalCharges"].replace("", pd.NA)
-
-    numeric_columns = ["MonthlyCharges", "TotalCharges", "tenure", "SeniorCitizen"]
-    for col in numeric_columns:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # ------------------------------------------------------------------
-    # 5. Drop rows with invalid or missing critical fields
-    # - customerID: required unique identifier
-    # - TotalCharges: contains ~11 blank values that cannot be recovered
-    # ------------------------------------------------------------------
-    df = df.dropna(subset=["customerID", "TotalCharges"]).reset_index(drop=True)
-
-    logging.info(f"Dataset after cleaning: {df.shape}")
-
-    # ------------------------------------------------------------------
-    # 6. Write cleaned dataset back to S3 (processed zone)
-    # ------------------------------------------------------------------
-    csv_buffer = StringIO()
-    df.to_csv(csv_buffer, index=False)
+    output_buffer = StringIO()
+    writer = csv.DictWriter(output_buffer, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(cleaned_rows)
 
     logging.info(f"Writing cleaned CSV to s3://{DATA_BUCKET}/{CLEAN_KEY}")
+
     s3.put_object(
         Bucket=DATA_BUCKET,
         Key=CLEAN_KEY,
-        Body=csv_buffer.getvalue()
+        Body=output_buffer.getvalue()
     )
 
-    logging.info("Cleaned dataset successfully written to processed folder.")
+    logging.info("Cleaned dataset written successfully.")
 
 
 # ----------------------------------------------------------------------
-# DAG definition
-# - schedule=None means “manual trigger only”
-# - start_date must be static (Airflow requirement)
+# DAG Definition
 # ----------------------------------------------------------------------
 default_args = {"owner": "airflow"}
 
@@ -107,3 +129,4 @@ with DAG(
         task_id="clean_telco_dataset",
         python_callable=clean_telco_data
     )
+
