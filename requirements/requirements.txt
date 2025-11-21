@@ -1,2 +1,4 @@
-pyarrow==14.0.1
-pandas==2.1.4
+pyarrow
+pandas
+xgboost
+scikit-learn
